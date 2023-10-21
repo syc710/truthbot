@@ -1,107 +1,180 @@
 import streamlit as st
-from langchain import PromptTemplate
-from langchain.llms import OpenAI
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.vectorstores import Chroma
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains import ConversationalRetrievalChain
+from langchain.chat_models import ChatOpenAI
+from langchain.document_loaders import UnstructuredFileLoader
+from langchain.document_loaders.image import UnstructuredImageLoader
+from langchain.document_loaders import ImageCaptionLoader
+from langchain.document_loaders import WebBaseLoader
+from langchain.docstore.document import Document
 
-template = """
-    Below is an email that may be poorly worded.
-    Your goal is to:
-    - Properly format the email
-    - Convert the input text to a specified tone
-    - Convert the input text to a specified dialect
+import os
+import pytube
+import openai
+import requests
 
-    Here are some examples different Tones:
-    - Formal: We went to Barcelona for the weekend. We have a lot of things to tell you.
-    - Informal: Went to Barcelona for the weekend. Lots to tell you.  
+# Chat UI title
+st.header("Responsible use of AI can stop mis-info")
+st.info("Provide the truth sources and ask questions like ChatGPT")
 
-    Here are some examples of words in different dialects:
-    - American: French Fries, cotton candy, apartment, garbage, cookie, green thumb, parking lot, pants, windshield
-    - British: chips, candyfloss, flag, rubbish, biscuit, green fingers, car park, trousers, windscreen
+# File uploader in the sidebar on the left
+with st.sidebar:
+    # Input for OpenAI API Key
+    openai_api_key = st.text_input("OpenAI API Key", "xxx", type="password")
 
-    Example Sentences from each dialect:
-    - American: I headed straight for the produce section to grab some fresh vegetables, like bell peppers and zucchini. After that, I made my way to the meat department to pick up some chicken breasts.
-    - British: Well, I popped down to the local shop just the other day to pick up a few bits and bobs. As I was perusing the aisles, I noticed that they were fresh out of biscuits, which was a bit of a disappointment, as I do love a good cuppa with a biscuit or two.
-
-    Please start the email with a warm introduction. Add the introduction if you need to.
-    
-    Below is the email, tone, and dialect:
-    TONE: {tone}
-    DIALECT: {dialect}
-    EMAIL: {email}
-    
-    YOUR {dialect} RESPONSE:
-"""
-
-prompt = PromptTemplate(
-    input_variables=["tone", "dialect", "email"],
-    template=template,
-)
-
-def load_LLM(openai_api_key):
-    """Logic for loading the chain you want to use should go here."""
-    # Make sure your openai_api_key is set as an environment variable
-    llm = OpenAI(temperature=.7, openai_api_key=openai_api_key)
-    return llm
-
-st.set_page_config(page_title="Globalize Email", page_icon=":robot:")
-st.header("Globalize Text")
-
-col1, col2 = st.columns(2)
-
-with col1:
-    st.markdown("Often professionals would like to improve their emails, but don't have the skills to do so. \n\n This tool \
-                will help you improve your email skills by converting your emails into a more professional format. This tool \
-                is powered by [LangChain](https://langchain.com/) and [OpenAI](https://openai.com) and made by \
-                [@GregKamradt](https://twitter.com/GregKamradt). \n\n View Source Code on [Github](https://github.com/gkamradt/globalize-text-streamlit/blob/main/main.py)")
-
-with col2:
-    st.image(image='fact_truth.jpeg', width=500, caption='https://twitter.com/DannyRichman/status/1598254671591723008')
-
-st.markdown("## Enter Your Email To Convert")
-
-def get_api_key():
-    input_text = st.text_input(label="OpenAI API Key ",  placeholder="Ex: sk-2twmA8tfCb8un4...", key="openai_api_key_input")
-    return input_text
-
-openai_api_key = get_api_key()
-
-col1, col2 = st.columns(2)
-with col1:
-    option_tone = st.selectbox(
-        'Which tone would you like your email to have?',
-        ('Formal', 'Informal'))
-    
-with col2:
-    option_dialect = st.selectbox(
-        'Which English Dialect would you like?',
-        ('American', 'British'))
-
-def get_text():
-    input_text = st.text_area(label="Email Input", label_visibility='collapsed', placeholder="Your Email...", key="email_input")
-    return input_text
-
-email_input = get_text()
-
-if len(email_input.split(" ")) > 700:
-    st.write("Please enter a shorter email. The maximum length is 700 words.")
-    st.stop()
-
-def update_text_with_example():
-    print ("in updated")
-    st.session_state.email_input = "Sally I am starts work at yours monday from dave"
-
-st.button("*See An Example*", type='secondary', help="Click to see an example of the email you will be converting.", on_click=update_text_with_example)
-
-st.markdown("### Your Converted Email:")
-
-if email_input:
+    # Check if OpenAI API Key is provided
     if not openai_api_key:
-        st.warning('Please insert OpenAI API Key. Instructions [here](https://help.openai.com/en/articles/4936850-where-do-i-find-my-secret-api-key)', icon="⚠️")
+        st.info("Please add your OpenAI API key to continue.")
         st.stop()
 
-    llm = load_LLM(openai_api_key=openai_api_key)
+    # Set OPENAI_API_KEY as an environment variable
 
-    prompt_with_email = prompt.format(tone=option_tone, dialect=option_dialect, email=email_input)
+    os.environ["OPENAI_API_KEY"] = openai_api_key
 
-    formatted_email = llm(prompt_with_email)
+# Initialize ChatOpenAI model
+llm = ChatOpenAI(temperature=0, max_tokens=1000, model_name="gpt-3.5-turbo", streaming=True)
 
-    st.write(formatted_email)
+# Load version history from the text file
+def load_version_history():
+    with open("version_history.txt", "r") as file:
+        return file.read()
+
+# Sidebar section for uploading files and providing a YouTube URL
+with st.sidebar:
+    st.image(image='fact_truth.jpeg')
+    uploaded_files = st.file_uploader("Please upload your truth source files (pdf/docs/txt/jpg/png/YouTube)", accept_multiple_files=True, type=None)
+    youtube_url = st.text_input("Truth source in YouTube URL", max_chars=200)
+    web_url = st.text_input("Truth source in Webpage URL", max_chars=200)
+    # Create an expander for the version history in the sidebar
+    # with st.sidebar.expander("**Version History**", expanded=False):
+    #    st.write(load_version_history())
+
+    st.info("Please refresh the browser if you decide to upload more files to reset the session", icon="🚨")
+
+# First check if OpenAI API Key is provided
+if not openai_api_key:
+    st.info("Please add your OpenAI API key to continue.")
+    st.stop()
+
+# Set OPENAI_API_KEY as an environment variable
+os.environ["OPENAI_API_KEY"] = openai_api_key
+
+
+
+# Check if files are uploaded or YouTube URL is provided
+if uploaded_files or youtube_url or web_url:
+    # Print the number of files uploaded or YouTube URL provided to the console
+    st.write(f"Number of files uploaded: {len(uploaded_files)}")
+
+    # Load the data and perform preprocessing only if it hasn't been loaded before
+    if "processed_data" not in st.session_state:
+        # Load the data from uploaded files
+        documents = []
+
+        if uploaded_files:
+            for uploaded_file in uploaded_files:
+                # Get the full file path of the uploaded file
+                file_path = os.path.join(os.getcwd(), uploaded_file.name)
+
+                # Save the uploaded file to disk
+                with open(file_path, "wb") as f:
+                    f.write(uploaded_file.getvalue())
+
+                # Check if the file is an image
+                if file_path.endswith((".png", ".jpg")):
+                    # Use ImageCaptionLoader to load the image file
+                    image_loader = ImageCaptionLoader(path_images=[file_path])
+
+                    # Load image captions
+                    image_documents = image_loader.load()
+
+                    # Append the Langchain documents to the documents list
+                    documents.extend(image_documents)
+                    
+                elif file_path.endswith((".pdf", ".docx", ".txt")):
+                    # Use UnstructuredFileLoader to load the PDF/DOCX/TXT file
+                    loader = UnstructuredFileLoader(file_path)
+                    loaded_documents = loader.load()
+
+                    # Extend the main documents list with the loaded documents
+                    documents.extend(loaded_documents)
+
+        # Load the YouTube audio stream if URL is provided
+        if youtube_url:
+            st.write("Youtube URL: " + youtube_url)
+            youtube_video = pytube.YouTube(youtube_url)
+            streams = youtube_video.streams.filter(only_audio=True)
+            stream = streams.first()
+            stream.download(filename="youtube_audio.mp4")
+            # Set the API key for Whisper
+            openai.api_key = openai_api_key
+            with open("youtube_audio.mp4", "rb") as audio_file:
+                transcript = openai.Audio.transcribe("whisper-1", audio_file)
+            youtube_text = transcript['text']
+
+            # Create a Langchain document instance for the transcribed text
+            youtube_document = Document(page_content=youtube_text, metadata={})
+            documents.append(youtube_document)
+
+        if web_url:
+            st.write("Webpage URL: " + web_url)
+            loader = WebBaseLoader([web_url])
+            loader.default_parser = "html.parser"
+            loaded_documents = loader.load()
+
+            # Create a Langchain document instance for the scraped web content
+            web_document = Document(page_content=loaded_documents[0].page_content, metadata={})   
+            documents.append(web_document)
+        # Chunk the data, create embeddings, and save in vectorstore
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=150)
+        document_chunks = text_splitter.split_documents(documents)
+
+        embeddings = OpenAIEmbeddings()
+        vectorstore = Chroma.from_documents(document_chunks, embeddings)
+
+        # Store the processed data in session state for reuse
+        st.session_state.processed_data = {
+            "document_chunks": document_chunks,
+            "vectorstore": vectorstore,
+        }
+
+    else:
+        # If the processed data is already available, retrieve it from session state
+        document_chunks = st.session_state.processed_data["document_chunks"]
+        vectorstore = st.session_state.processed_data["vectorstore"]
+
+    # Initialize Langchain's QA Chain with the vectorstore
+    qa = ConversationalRetrievalChain.from_llm(llm, vectorstore.as_retriever())
+
+    # Initialize chat history
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    # Display chat messages from history on app rerun
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # Accept user input
+    if prompt := st.chat_input("Ask your questions?"):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        # Query the assistant using the latest chat history
+        result = qa({"question": prompt, "chat_history": [(message["role"], message["content"]) for message in st.session_state.messages]})
+
+        # Display assistant response in chat message container
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            full_response = ""
+            full_response = result["answer"]
+            message_placeholder.markdown(full_response + "|")
+        message_placeholder.markdown(full_response)    
+        print(full_response)
+        st.session_state.messages.append({"role": "assistant", "content": full_response})
+
+else:
+    st.write("Please upload your files, provide a web link, or provide a YouTube URL for transcription as the source of trust.")
