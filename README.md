@@ -1,0 +1,2 @@
+# truthbot
+gptbot for journalism
